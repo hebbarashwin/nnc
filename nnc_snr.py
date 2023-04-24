@@ -145,8 +145,10 @@ def train(model, dataloader, optimizer, device):
         optimizer.step()
         
         running_loss += loss.item()
+    running_loss /= len(dataloader)
+    psnr = 10*np.log10(torch.max(images)**2 / running_loss)
     
-    return running_loss / len(dataloader)
+    return running_loss, psnr
 
 def test(model, dataloader, device):
     model.eval()
@@ -167,21 +169,25 @@ def test(model, dataloader, device):
             loss = nn.MSELoss()(y, target)
             
             running_loss += loss.item()
+    running_loss = running_loss / len(dataloader)
+    psnr = 10*np.log10(torch.max(images)**2 / running_loss)
     
-    return running_loss / len(dataloader)
+    return running_loss, psnr
 
 if __name__ == '__main__':
 
     training = True
-    device = torch.device("mps")
+    # change device to cuda or cpu .. mps is for mac-m1 gpu
+    device = torch.device("mps") 
     epochs = 150
     batch_size = 32
     input_size = 14 * 28
     hidden_size = 256
     output_size = 256
+    
     noise_std_dev = np.sqrt(0.0001)
-
     power = 7
+
     eq_noise_std_dev = noise_std_dev / np.sqrt(power)
     learning_rate = 0.001
     
@@ -209,10 +215,10 @@ if __name__ == '__main__':
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     if training:
         for epoch in tqdm(range(epochs)):
-            train_loss = train(model, train_loader, optimizer, device)
-            test_loss = test(model, test_loader, device)
+            train_loss, train_psnr = train(model, train_loader, optimizer, device)
+            test_loss, test_psnr = test(model, test_loader, device)
             
-            print(f'Epoch {epoch + 1}/{epochs}, Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}')
+            print(f'Epoch {epoch + 1}/{epochs}, Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}, Test PSNR: {test_psnr:.4f}')
             # save best model
             if epoch == 0:
                 best_loss = test_loss
@@ -228,9 +234,8 @@ if __name__ == '__main__':
     # testing
     model.load_state_dict(torch.load('best_model.pt'))
     model.eval()
-    test_loss = test(model, test_loader, device)
+    test_loss, test_psnr = test(model, test_loader, device)
 
-    # get maximum pixel value in test set
     
 
     
