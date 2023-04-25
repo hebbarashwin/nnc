@@ -6,8 +6,33 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 
 # import networkx as nx
+import argparse
+import random
 import numpy as np
 from tqdm import tqdm
+import os
+
+def get_args():
+    parser = argparse.ArgumentParser(description='Butterfly Network Training')
+    parser.add_argument('-e', '--epochs', type=int, default=150, help='Number of training epochs')
+    parser.add_argument('-b', '--batch_size', type=int, default=32, help='Batch size for training and testing')
+    parser.add_argument(    '--input_size', type=int, default=14 * 28, help='Input size for the model')
+    parser.add_argument(    '--hidden_size', type=int, default=256, help='Hidden size for the model')
+    parser.add_argument(    '--output_size', type=int, default=256, help='Output size for the model')
+    parser.add_argument('-n', '--noise_sigma', type=float, default=0.01, help='Noise standard deviation')
+    parser.add_argument('-p', '--power', type=int, default=7, help='Power for eq_noise_std_dev calculation')
+    parser.add_argument('-lr', '--learning_rate', type=float, default=0.001, help='Learning rate for optimizer')
+    parser.add_argument('-d', '--device', type=str, default='cpu', help='Device to use for training (cpu, cuda, mps)')
+    parser.add_argument('-mp', '--model_path', type=str, default=None, help='Path to save and load the best model')
+    parser.add_argument('--test', action='store_true', help='Only test the model')
+
+    args = parser.parse_args()
+
+    if args.model_path is None:
+        rand_num = random.randint(10000, 99999)
+        args.model_path = f'{rand_num}'
+
+    return args
 
     
 class SimpleFullyConnected(nn.Module):
@@ -125,8 +150,9 @@ class ButterflyNetwork(nn.Module):
 def train(model, dataloader, optimizer, device):
     model.train()
     running_loss = 0.0
-    
-    for images, labels in tqdm(dataloader):
+
+    progress = tqdm(dataloader, leave=False, desc="Batches")
+    for images, labels in progress:
         optimizer.zero_grad()
         
         x1 = images[:, :, :14, :].view(images.size(0), -1).to(device)
@@ -174,29 +200,32 @@ def test(model, dataloader, device):
     
     return running_loss, psnr
 
-if __name__ == '__main__':
+def main(args):
 
-    training = True
+    model_path = os.path.join('models', args.model_path, 'model.pt')
+    model_dir = os.path.dirname(model_path)
+    os.makedirs(model_dir, exist_ok=True)
+
+    print(f"Model path : {model_path}")
+
+
+
     # change device to cuda or cpu .. mps is for mac-m1 gpu
-    device = torch.device("mps") 
+    if args.device == 'cpu':
+        device = torch.device("cpu") 
+    elif args.device == 'cuda':
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif args.device == 'mps':
+        device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+       
     epochs = 150
-    batch_size = 32
-    input_size = 14 * 28
-    hidden_size = 256
-    output_size = 256
-    
-    noise_std_dev = np.sqrt(0.0001)
-    power = 7
-
-    eq_noise_std_dev = noise_std_dev / np.sqrt(power)
-    learning_rate = 0.001
-    
-    adjacency_matrix = torch.tensor([
-        [0, 0, 1, 0, 1, 0],
-        [0, 0, 1, 0, 0, 1],
-        [0, 0, 0, 1, 0, 0],
-        [0, 0, 0, 0, 1, 1]
-    ], dtype=torch.float32)
+    eq_noise_sigma = args.noise_sigma / np.sqrt(args.power)    
+    # adjacency_matrix = torch.tensor([
+    #     [0, 0, 1, 0, 1, 0],
+    #     [0, 0, 1, 0, 0, 1],
+    #     [0, 0, 0, 1, 0, 0],
+    #     [0, 0, 0, 0, 1, 1]
+    # ], dtype=torch.float32)
 
 
     transform = transforms.Compose([
@@ -207,35 +236,44 @@ if __name__ == '__main__':
     train_dataset = torchvision.datasets.MNIST(root='./data', train=True, transform=transform, download=True)
     test_dataset = torchvision.datasets.MNIST(root='./data', train=False, transform=transform, download=True)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
 
-    model = ButterflyNetwork(input_size, hidden_size, output_size, eq_noise_std_dev).to(device)
+    model = ButterflyNetwork(args.input_size, args.hidden_size, args.output_size, eq_noise_sigma).to(device)
     
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    if training:
-        for epoch in tqdm(range(epochs)):
-            train_loss, train_psnr = train(model, train_loader, optimizer, device)
-            test_loss, test_psnr = test(model, test_loader, device)
-            
-            print(f'Epoch {epoch + 1}/{epochs}, Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}, Test PSNR: {test_psnr:.4f}')
-            # save best model
-            if epoch == 0:
-                best_loss = test_loss
-                torch.save(model.state_dict(), 'best_model.pt')
-            else:
-                if test_loss < best_loss:
+    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+    if not args.test:
+        with tqdm(range(args.epochs), desc="Epochs") as epoch_progress:
+            for epoch in epoch_progress:
+                train_loss, train_psnr = train(model, train_loader, optimizer, device)
+                test_loss, test_psnr = test(model, test_loader, device)
+
+                epoch_progress.set_postfix({"Test Loss": test_loss, "Test PSNR": test_psnr})
+                epoch_progress.write(f'Epoch {epoch + 1}/{args.epochs}, Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}, Test PSNR: {test_psnr:.4f}')
+
+                # save best model
+                if epoch == 0:
                     best_loss = test_loss
-                    torch.save(model.state_dict(), 'best_model.pt')
+                    torch.save(model.state_dict(), model_path)
+                else:
+                    if test_loss < best_loss:
+                        best_loss = test_loss
+                        torch.save(model.state_dict(), model_path)
 
         print(f"Best Test Loss: {best_loss:.4f}")
         print("Model saved at best_model.pt")
 
     # testing
-    model.load_state_dict(torch.load('best_model.pt'))
-    model.eval()
-    test_loss, test_psnr = test(model, test_loader, device)
+    if os.path.isfile(model_path):
+        model.load_state_dict(torch.load(model_path))
+        model.eval()
+        test_loss, test_psnr = test(model, test_loader, device)
+        print(f"Loaded model, Test Loss: {test_loss:.4f}, Test PSNR: {test_psnr:.4f}")
+    else:
+        print(f"No model found at {model_path}")
+
 
     
-
-    
+if __name__ == '__main__':
+    args = get_args()
+    main(args)
