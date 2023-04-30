@@ -12,6 +12,13 @@ import numpy as np
 from tqdm import tqdm
 import os
 
+def snr_sigma2db(sigma):
+    return 10 * np.log10(1 / (sigma ** 2))
+
+def snr_db2sigma(snr):
+    return 10 ** (-snr *1.0/ 20)
+
+
 def get_args():
     parser = argparse.ArgumentParser(description='Butterfly Network Training')
     parser.add_argument('-e', '--epochs', type=int, default=150, help='Number of training epochs')
@@ -19,13 +26,14 @@ def get_args():
     parser.add_argument(    '--input_size', type=int, default=14 * 28, help='Input size for the model')
     parser.add_argument(    '--hidden_size', type=int, default=256, help='Hidden size for the model')
     parser.add_argument(    '--output_size', type=int, default=256, help='Output size for the model')
-    parser.add_argument('-n', '--noise_sigma', type=float, default=0.01, help='Noise standard deviation')
-    parser.add_argument('-p', '--power', type=int, default=7, help='Power for eq_noise_std_dev calculation')
+    parser.add_argument('-t_s', '--train_snr', type=float, default=40, help='Training SNR (40dB : sigma = 0.01)')
+    parser.add_argument('-v_s', '--val_snr', type=float, default=40, help='Validation SNR (40dB : sigma = 0.01)')
+    parser.add_argument('-p', '--power', type=int, default=1, help='Power for eq_noise_std_dev calculation')
     parser.add_argument('-lr', '--learning_rate', type=float, default=0.001, help='Learning rate for optimizer')
     parser.add_argument('-d', '--device', type=str, default='cpu', help='Device to use for training (cpu, cuda, mps)')
     parser.add_argument('-mp', '--model_path', type=str, default=None, help='Path to save and load the best model')
     parser.add_argument('--test', action='store_true', help='Only test the model')
-
+    parser.add_argument('--scale_outputs', action='store_true', help='Scale outputs like paper')
     args = parser.parse_args()
 
     if args.model_path is None:
@@ -52,10 +60,11 @@ class SimpleFullyConnected(nn.Module):
         return x
 
 class ButterflyNetwork(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, noise_std_dev):
+    def __init__(self, input_size, hidden_size, output_size, noise_std_dev, scale_power = 1):
         super(ButterflyNetwork, self).__init__()
         self.noise_std_dev = noise_std_dev
-        
+        self.scale_power = scale_power
+
         self.A = SimpleFullyConnected(input_size, hidden_size, output_size)
         self.B = SimpleFullyConnected(input_size, hidden_size, output_size)
         self.C = SimpleFullyConnected(2 * output_size, hidden_size, output_size)
@@ -63,25 +72,30 @@ class ButterflyNetwork(nn.Module):
         self.E = SimpleFullyConnected(2 * output_size, hidden_size, input_size)
         self.F = SimpleFullyConnected(2 * output_size, hidden_size, input_size)
 
-    def add_noise(self, x):
-        noise = torch.randn_like(x) * self.noise_std_dev
+    def add_noise(self, x, noise_std_dev):
+        noise = torch.randn_like(x) * noise_std_dev
         return x + noise
 
-    def forward(self, x1, x2):
+    def forward(self, x1, x2, noise_std_dev = None):
 
-        x_A = self.A(x1)
-        y_A = self.add_noise(x_A)
-        x_B = self.B(x2)
-        y_B = self.add_noise(x_B)
+        if noise_std_dev is None:
+            noise_std_dev = self.noise_std_dev
+        x_A = self.A(x1) * self.scale_power
+        y_AC = self.add_noise(x_A, noise_std_dev)
+        y_AE = self.add_noise(x_A, noise_std_dev)
+        x_B = self.B(x2) * self.scale_power
+        y_BC = self.add_noise(x_B, noise_std_dev)
+        y_BF = self.add_noise(x_B, noise_std_dev)
         
-        x_C = self.C(torch.cat((y_A, y_B), dim=-1))
-        y_C = self.add_noise(x_C)
+        x_C = self.C(torch.cat((y_AC, y_BC), dim=-1)) * self.scale_power
+        y_CD = self.add_noise(x_C, noise_std_dev)
         
-        x_D = self.D(y_C)
-        y_D = self.add_noise(x_D)
+        x_D = self.D(y_CD) * self.scale_power
+        y_DE = self.add_noise(x_D, noise_std_dev)
+        y_DF = self.add_noise(x_D, noise_std_dev)
         
-        x_E = self.E(torch.cat((y_A, y_D), dim=-1))
-        x_F = self.F(torch.cat((y_B, y_D), dim=-1))
+        x_E = self.E(torch.cat((y_AE, y_DE), dim=-1)) * self.scale_power
+        x_F = self.F(torch.cat((y_BF, y_DF), dim=-1)) * self.scale_power
         
         y1 = x_E
         y2 = x_F
@@ -176,29 +190,33 @@ def train(model, dataloader, optimizer, device):
     
     return running_loss, psnr
 
-def test(model, dataloader, device):
-    model.eval()
-    running_loss = 0.0
+def test(model, dataloader, test_sigma_range, device):
     
+    results = []
+    model.eval()    
     with torch.no_grad():
-        for images, labels in dataloader:
-            x1 = images[:, :, :14, :].view(images.size(0), -1).to(device)
-            x2 = images[:, :, 14:, :].view(images.size(0), -1).to(device)
-            
-            y1, y2, y_list = model(x1, x2)
-            
-            y = torch.cat((y1, y2), dim=1)
-            target = torch.cat((x1, x2), dim=1)
-            
-            # loss = custom_loss(y, target, adjacency_matrix, lambda_matrix, y_list)
-            # loss = nn.BCEWithLogitsLoss()(y, target)
-            loss = nn.MSELoss()(y, target)
-            
-            running_loss += loss.item()
-    running_loss = running_loss / len(dataloader)
-    psnr = 10*np.log10(torch.max(images)**2 / running_loss)
-    
-    return running_loss, psnr
+        for sigma in test_sigma_range:
+            snr = snr_sigma2db(sigma)
+            running_loss = 0.0
+            for images, labels in dataloader:
+                x1 = images[:, :, :14, :].view(images.size(0), -1).to(device)
+                x2 = images[:, :, 14:, :].view(images.size(0), -1).to(device)
+                
+                y1, y2, y_list = model(x1, x2, noise_std_dev=sigma)
+                
+                y = torch.cat((y1, y2), dim=1)
+                target = torch.cat((x1, x2), dim=1)
+                
+                # loss = custom_loss(y, target, adjacency_matrix, lambda_matrix, y_list)
+                # loss = nn.BCEWithLogitsLoss()(y, target)
+                loss = nn.MSELoss()(y, target)
+                
+                running_loss += loss.item()
+            running_loss = running_loss / len(dataloader)
+            psnr = 10*np.log10(torch.max(images)**2 / running_loss).item()
+            results.append((snr, running_loss, psnr))
+
+    return results
 
 def main(args):
 
@@ -217,9 +235,22 @@ def main(args):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     elif args.device == 'mps':
         device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-       
-    epochs = 150
-    eq_noise_sigma = args.noise_sigma / np.sqrt(args.power)    
+
+    train_sigma = snr_db2sigma(args.train_snr)
+    val_sigma = snr_db2sigma(args.val_snr)
+    test_snr = np.arange(-60, 60, 10)
+    test_sigma = np.array([snr_db2sigma(snr) for snr in test_snr])
+    if not args.scale_outputs:       
+        eq_train_sigma = train_sigma / np.sqrt(args.power)  
+        eq_val_sigma = val_sigma / np.sqrt(args.power)
+        eq_test_sigma = test_sigma / np.sqrt(args.power)
+        scale_power = 1
+    else:
+        eq_train_sigma = train_sigma
+        eq_val_sigma = val_sigma
+        eq_test_sigma = test_sigma
+        scale_power = args.power
+
     # adjacency_matrix = torch.tensor([
     #     [0, 0, 1, 0, 1, 0],
     #     [0, 0, 1, 0, 0, 1],
@@ -239,36 +270,55 @@ def main(args):
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
 
-    model = ButterflyNetwork(args.input_size, args.hidden_size, args.output_size, eq_noise_sigma).to(device)
+    model = ButterflyNetwork(args.input_size, args.hidden_size, args.output_size, eq_train_sigma, scale_power).to(device)
     
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
     if not args.test:
-        with tqdm(range(args.epochs), desc="Epochs") as epoch_progress:
-            for epoch in epoch_progress:
-                train_loss, train_psnr = train(model, train_loader, optimizer, device)
-                test_loss, test_psnr = test(model, test_loader, device)
+        try:
+            with tqdm(range(args.epochs), desc="Epochs") as epoch_progress:
+                for epoch in epoch_progress:
+                    train_loss, train_psnr = train(model, train_loader, optimizer, device)
+                    results = test(model, test_loader, np.array([eq_val_sigma]), device)
+                    val_snrs, test_losses, test_psnrs = zip(*results)
+                    val_snr = val_snrs[0]
+                    test_loss = test_losses[0]
+                    test_psnr = test_psnrs[0]
 
-                epoch_progress.set_postfix({"Test Loss": test_loss, "Test PSNR": test_psnr})
-                epoch_progress.write(f'Epoch {epoch + 1}/{args.epochs}, Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}, Test PSNR: {test_psnr:.4f}')
+                    epoch_progress.set_postfix({"Val SNR": val_snr, "Test Loss": test_loss, "Test PSNR": test_psnr})
 
-                # save best model
-                if epoch == 0:
-                    best_loss = test_loss
-                    torch.save(model.state_dict(), model_path)
-                else:
-                    if test_loss < best_loss:
+                    result_str = f'Epoch {epoch + 1}/{args.epochs}, Train Loss: {train_loss:.4f}'
+                    for snr, loss, psnr in results:
+                        result_str += f', Test (SNR {snr:.2f}dB) Loss: {loss:.4f}, PSNR: {psnr:.4f}'
+
+                    epoch_progress.write(result_str)
+
+                    # save best model
+                    if epoch == 0:
                         best_loss = test_loss
                         torch.save(model.state_dict(), model_path)
+                    else:
+                        if test_loss < best_loss:
+                            best_loss = test_loss
+                            torch.save(model.state_dict(), model_path)
 
-        print(f"Best Test Loss: {best_loss:.4f}")
-        print("Model saved at best_model.pt")
+            print(f"Best Test Loss: {best_loss:.4f}")
+            print(f"Model saved at {model_path}")
+        except KeyboardInterrupt:
+            print("Interrupted by user")
+            print(f"Model saved at {model_path}")
+            torch.save(model.state_dict(), model_path)
 
     # testing
+    print(f"Testing")
     if os.path.isfile(model_path):
         model.load_state_dict(torch.load(model_path))
         model.eval()
-        test_loss, test_psnr = test(model, test_loader, device)
-        print(f"Loaded model, Test Loss: {test_loss:.4f}, Test PSNR: {test_psnr:.4f}")
+        # snr_range = np.arange(0, 60, 10)
+        result = test(model, test_loader, eq_test_sigma, device)
+        snr_range, test_losses, test_psnrs = zip(*result)
+        test_losses_str = ', '.join([f"{loss:.4f}" for loss in test_losses])
+        test_psnrs_str = ', '.join([f"{psnr:.4f}" for psnr in test_psnrs])
+        print(f"Loaded model:\n SNR range: {snr_range}\n Test Loss: {test_losses_str}\n Test PSNR: {test_psnrs_str}")
     else:
         print(f"No model found at {model_path}")
 
