@@ -32,6 +32,7 @@ def get_args():
     parser.add_argument('-lr', '--learning_rate', type=float, default=0.001, help='Learning rate for optimizer')
     parser.add_argument('-d', '--device', type=str, default='cpu', help='Device to use for training (cpu, cuda, mps)')
     parser.add_argument('-mp', '--model_path', type=str, default=None, help='Path to save and load the best model')
+    parser.add_argument('--dropout', action='store_true', help='Add dropout during training')
     parser.add_argument('--test', action='store_true', help='Only test the model')
     parser.add_argument('--scale_outputs', action='store_true', help='Scale outputs like paper')
     args = parser.parse_args()
@@ -42,6 +43,20 @@ def get_args():
 
     return args
 
+def link_dropout(x, p):
+    # x - batched input (first dimension is batch)
+    assert 0 <= p <= 1
+
+    # Generate a random number for each example in the batch
+    random_numbers = torch.rand(x.size(0), 1, device=x.device)
+    # Create a mask with the same size as the input_tensor
+    dropout_mask = (random_numbers >= p).float()
+    # Expand the dropout mask to match the shape of the input_tensor
+    dropout_mask = dropout_mask.expand_as(x)
+    # Apply the dropout mask to the input_tensor
+    output_tensor = x * dropout_mask
+    
+    return output_tensor
     
 class SimpleFullyConnected(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
@@ -72,35 +87,101 @@ class ButterflyNetwork(nn.Module):
         self.E = SimpleFullyConnected(2 * output_size, hidden_size, input_size)
         self.F = SimpleFullyConnected(2 * output_size, hidden_size, input_size)
 
+        # self.dropout = nn.Dropout(0.1)
+        self.dropout = lambda x: link_dropout(x, 0.1)
+
     def add_noise(self, x, noise_std_dev):
+
         noise = torch.randn_like(x) * noise_std_dev
         return x + noise
 
-    def forward(self, x1, x2, noise_std_dev = None):
+    def forward(self, x1, x2, noise_std_dev = None, dropped = None):
+
+        if dropped is None:
+            dropped = []
+
+        if noise_std_dev is None:
+            noise_std_dev = float(self.noise_std_dev)  # Ensure that noise_std_dev is a scalar (float)
+
+
+        x_A = self.A(x1) * self.scale_power
+        y_AC = self.add_noise(self.dropout(x_A) if 'AC' in dropped else x_A, noise_std_dev)
+        y_AE = self.add_noise(self.dropout(x_A) if 'AE' in dropped else x_A, noise_std_dev)
+
+        x_B = self.B(x2) * self.scale_power
+        y_BC = self.add_noise(self.dropout(x_B) if 'BC' in dropped else x_B, noise_std_dev)
+        y_BF = self.add_noise(self.dropout(x_B) if 'BF' in dropped else x_B, noise_std_dev)
+
+        x_C = self.C(torch.cat((y_AC, y_BC), dim=-1)) * self.scale_power
+        y_CD = self.add_noise(self.dropout(x_C) if 'CD' in dropped else x_C, noise_std_dev)
+
+        x_D = self.D(y_CD) * self.scale_power
+        y_DE = self.add_noise(self.dropout(x_D) if 'DE' in dropped else x_D, noise_std_dev)
+        y_DF = self.add_noise(self.dropout(x_D) if 'DF' in dropped else x_D, noise_std_dev)
+
+        x_E = self.E(torch.cat((y_AE, y_DE), dim=-1)) * self.scale_power
+        x_F = self.F(torch.cat((y_BF, y_DF), dim=-1)) * self.scale_power
+
+        y1 = x_E
+        y2 = x_F
+
+        return y1, y2, [x_A, x_B, x_C, x_D, x_E, x_F]
+    
+    def run_drop_link(self, x1, x2, dropped = [], noise_std_dev = None):
 
         if noise_std_dev is None:
             noise_std_dev = self.noise_std_dev
         x_A = self.A(x1) * self.scale_power
-        y_AC = self.add_noise(x_A, noise_std_dev)
-        y_AE = self.add_noise(x_A, noise_std_dev)
+
+        if 'AC' not in dropped:
+            y_AC = self.add_noise(x_A, noise_std_dev)
+        else:
+            y_AC = self.add_noise(torch.zeros_like(x_A, device=x_A.device), noise_std_dev)
+
+        if 'AE' not in dropped:
+            y_AE = self.add_noise(x_A, noise_std_dev)
+        else:
+            y_AE = self.add_noise(torch.zeros_like(x_A, device=x_A.device), noise_std_dev)
+
         x_B = self.B(x2) * self.scale_power
-        y_BC = self.add_noise(x_B, noise_std_dev)
-        y_BF = self.add_noise(x_B, noise_std_dev)
-        
+
+        if 'BC' not in dropped:
+            y_BC = self.add_noise(x_B, noise_std_dev)
+        else:
+            y_BC = self.add_noise(torch.zeros_like(x_B, device=x_B.device), noise_std_dev)
+
+        if 'BF' not in dropped:
+            y_BF = self.add_noise(x_B, noise_std_dev)
+        else:
+            y_BF = self.add_noise(torch.zeros_like(x_B, device=x_B.device), noise_std_dev)
+
         x_C = self.C(torch.cat((y_AC, y_BC), dim=-1)) * self.scale_power
-        y_CD = self.add_noise(x_C, noise_std_dev)
-        
+
+        if 'CD' not in dropped:
+            y_CD = self.add_noise(x_C, noise_std_dev)
+        else:
+            y_CD = self.add_noise(torch.zeros_like(x_C, device=x_C.device), noise_std_dev)
+
         x_D = self.D(y_CD) * self.scale_power
-        y_DE = self.add_noise(x_D, noise_std_dev)
-        y_DF = self.add_noise(x_D, noise_std_dev)
-        
+
+        if 'DE' not in dropped:
+            y_DE = self.add_noise(x_D, noise_std_dev)
+        else:
+            y_DE = self.add_noise(torch.zeros_like(x_D, device=x_D.device), noise_std_dev)
+
+        if 'DF' not in dropped:
+            y_DF = self.add_noise(x_D, noise_std_dev)
+        else:
+            y_DF = self.add_noise(torch.zeros_like(x_D, device=x_D.device), noise_std_dev)
+
         x_E = self.E(torch.cat((y_AE, y_DE), dim=-1)) * self.scale_power
         x_F = self.F(torch.cat((y_BF, y_DF), dim=-1)) * self.scale_power
-        
+
         y1 = x_E
         y2 = x_F
-        
+
         return y1, y2, [x_A, x_B, x_C, x_D, x_E, x_F]
+
 
 # general graph?
 # class GraphButterflyNetwork(nn.Module):
@@ -161,7 +242,7 @@ class ButterflyNetwork(nn.Module):
 #     # Return the total loss as the sum of the binary cross-entropy loss and the regularization term
 #     return mse_loss + expectation_loss
 
-def train(model, dataloader, optimizer, device):
+def train(model, dataloader, optimizer, device, dropped_list = None):
     model.train()
     running_loss = 0.0
 
@@ -172,7 +253,7 @@ def train(model, dataloader, optimizer, device):
         x1 = images[:, :, :14, :].view(images.size(0), -1).to(device)
         x2 = images[:, :, 14:, :].view(images.size(0), -1).to(device)
         
-        y1, y2, y_list = model(x1, x2)
+        y1, y2, y_list = model(x1, x2, dropped = dropped_list)
         
         y = torch.cat((y1, y2), dim=1)
         target = torch.cat((x1, x2), dim=1)
@@ -218,8 +299,36 @@ def test(model, dataloader, test_sigma_range, device):
 
     return results
 
-def main(args):
+def test_dropped(model, dataloader, test_sigma_range, device, dropped = []):
+    
+    results = []
+    model.eval()    
+    with torch.no_grad():
+        for sigma in test_sigma_range:
+            snr = snr_sigma2db(sigma)
+            running_loss = 0.0
+            for images, labels in dataloader:
+                x1 = images[:, :, :14, :].view(images.size(0), -1).to(device)
+                x2 = images[:, :, 14:, :].view(images.size(0), -1).to(device)
+                
+                y1, y2, y_list = model.run_drop_link(x1, x2, noise_std_dev=sigma, dropped=dropped)
+                
+                y = torch.cat((y1, y2), dim=1)
+                target = torch.cat((x1, x2), dim=1)
+                
+                # loss = custom_loss(y, target, adjacency_matrix, lambda_matrix, y_list)
+                # loss = nn.BCEWithLogitsLoss()(y, target)
+                loss = nn.MSELoss()(y, target)
+                
+                running_loss += loss.item()
+            running_loss = running_loss / len(dataloader)
+            psnr = 10*np.log10(torch.max(images)**2 / running_loss).item()
+            results.append((snr, running_loss, psnr))
 
+    return results
+# def main(args):
+if __name__ == '__main__':
+    args = get_args()
     model_path = os.path.join('models', args.model_path, 'model.pt')
     model_dir = os.path.dirname(model_path)
     os.makedirs(model_dir, exist_ok=True)
@@ -276,8 +385,12 @@ def main(args):
     if not args.test:
         try:
             with tqdm(range(args.epochs), desc="Epochs") as epoch_progress:
+                if args.dropout:
+                    dropped_list = ['AE', 'BF']
+                else:
+                    dropped_list = []
                 for epoch in epoch_progress:
-                    train_loss, train_psnr = train(model, train_loader, optimizer, device)
+                    train_loss, train_psnr = train(model, train_loader, optimizer, device, dropped_list)
                     results = test(model, test_loader, np.array([eq_val_sigma]), device)
                     val_snrs, test_losses, test_psnrs = zip(*results)
                     val_snr = val_snrs[0]
@@ -311,10 +424,16 @@ def main(args):
     # testing
     print(f"Testing")
     if os.path.isfile(model_path):
-        model.load_state_dict(torch.load(model_path))
+        model.load_state_dict(torch.load(model_path, map_location=device))
         model.eval()
         # snr_range = np.arange(0, 60, 10)
         result = test(model, test_loader, eq_test_sigma, device)
+        snr_range, test_losses, test_psnrs = zip(*result)
+        test_losses_str = ', '.join([f"{loss:.4f}" for loss in test_losses])
+        test_psnrs_str = ', '.join([f"{psnr:.4f}" for psnr in test_psnrs])
+        print(f"Loaded model:\n SNR range: {snr_range}\n Test Loss: {test_losses_str}\n Test PSNR: {test_psnrs_str}")
+
+        result = test_dropped(model, test_loader, eq_test_sigma, device, ['AE'])
         snr_range, test_losses, test_psnrs = zip(*result)
         test_losses_str = ', '.join([f"{loss:.4f}" for loss in test_losses])
         test_psnrs_str = ', '.join([f"{psnr:.4f}" for psnr in test_psnrs])
@@ -324,6 +443,6 @@ def main(args):
 
 
     
-if __name__ == '__main__':
-    args = get_args()
-    main(args)
+# if __name__ == '__main__':
+#     args = get_args()
+#     main(args)
