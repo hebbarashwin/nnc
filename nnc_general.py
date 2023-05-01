@@ -87,11 +87,11 @@ def train(model, dataloader, optimizer, device, dropped_list = None):
             x1 = images[:, :, :14, :].view(images.size(0), -1).to(device)
             x2 = images[:, :, 14:, :].view(images.size(0), -1).to(device)
             x = [x1, x2]
-        elif len(model.graph_inputs) == 2:
-            x1 = images[:, :, :14, :14].view(images.size(0), -1).to(device)
-            x2 = images[:, :, 14:, :14].view(images.size(0), -1).to(device)
-            x3 = images[:, :, :14, 14:].view(images.size(0), -1).to(device)
-            x4 = images[:, :, 14:, 14:].view(images.size(0), -1).to(device)
+        elif len(model.graph_inputs) == 4:
+            x1 = images[:, :, :14, :14].reshape(images.size(0), -1).to(device)
+            x2 = images[:, :, 14:, :14].reshape(images.size(0), -1).to(device)
+            x3 = images[:, :, :14, 14:].reshape(images.size(0), -1).to(device)
+            x4 = images[:, :, 14:, 14:].reshape(images.size(0), -1).to(device)
             x = [x1, x2, x3, x4]
         
         output_list = model(x)#, dropped = dropped_list)
@@ -139,11 +139,11 @@ def test(model, dataloader, test_sigma_range, device, quantize = False, num_bits
                     x1 = images[:, :, :14, :].view(images.size(0), -1).to(device)
                     x2 = images[:, :, 14:, :].view(images.size(0), -1).to(device)
                     x = [x1, x2]
-                elif len(model.graph_inputs) == 2:
-                    x1 = images[:, :, :14, :14].view(images.size(0), -1).to(device)
-                    x2 = images[:, :, 14:, :14].view(images.size(0), -1).to(device)
-                    x3 = images[:, :, :14, 14:].view(images.size(0), -1).to(device)
-                    x4 = images[:, :, 14:, 14:].view(images.size(0), -1).to(device)
+                elif len(model.graph_inputs) == 4:
+                    x1 = images[:, :, :14, :14].reshape(images.size(0), -1).to(device)
+                    x2 = images[:, :, 14:, :14].reshape(images.size(0), -1).to(device)
+                    x3 = images[:, :, :14, 14:].reshape(images.size(0), -1).to(device)
+                    x4 = images[:, :, 14:, 14:].reshape(images.size(0), -1).to(device)
                     x = [x1, x2, x3, x4]
                 
                 output_list = model(x, noise_std_dev = sigma)#, dropped = dropped_list)
@@ -235,7 +235,6 @@ class GeneralDAG(nn.Module):
                 o_size = len(self.graph_inputs)*input_size 
             else:
                 o_size = output_size 
-
             self.nn_modules[str(node.name)] = SimpleFullyConnected(i_size, hidden_size, o_size)
 
     def topological_sort(self):
@@ -293,7 +292,7 @@ class GeneralDAG(nn.Module):
 # def main(args):
 if __name__ == '__main__':
     args = get_args()
-    model_path = os.path.join('models', args.model_path, 'model.pt')
+    model_path = os.path.join('g4models', args.model_path, 'model.pt')
     model_dir = os.path.dirname(model_path)
     os.makedirs(model_dir, exist_ok=True)
 
@@ -328,8 +327,8 @@ if __name__ == '__main__':
     # change device to cuda or cpu .. mps is for mac-m1 gpu
     if args.device == 'cpu':
         device = torch.device("cpu") 
-    elif args.device == 'cuda':
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif 'cuda' in args.device:
+        device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     elif args.device == 'mps':
         device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
@@ -359,8 +358,8 @@ if __name__ == '__main__':
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
 
-    input_size = (28*28)/args.num_inputs 
-    model = GeneralDAG(nodes, args.input_size, args.hidden_size, args.output_size, eq_train_sigma, scale_power).to(device)
+    input_size = (28*28)//args.num_inputs 
+    model = GeneralDAG(nodes, input_size, args.hidden_size, args.output_size, eq_train_sigma, scale_power).to(device)
     
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
     if not args.test:
