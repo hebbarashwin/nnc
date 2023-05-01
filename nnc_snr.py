@@ -5,7 +5,7 @@ import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 
-# import networkx as nx
+import networkx as nx
 import argparse
 import random
 import numpy as np
@@ -58,6 +58,28 @@ def link_dropout(x, p):
     
     return output_tensor
     
+class QuantizeSTE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, tensor, num_bits):
+        min_val = tensor.min()
+        max_val = tensor.max()
+        qmin = 0
+        qmax = 2 ** num_bits - 1
+        scale = (max_val - min_val) / (qmax - qmin)
+        q_tensor = torch.clamp((tensor - min_val) / scale + qmin, qmin, qmax)
+        q_tensor = torch.round(q_tensor) * scale + min_val
+        ctx.save_for_backward(tensor, q_tensor)
+        return q_tensor
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        tensor, q_tensor = ctx.saved_tensors
+        grad_input = grad_output.clone()
+        return grad_input, None
+
+def quantize_output(tensor, num_bits):
+    return QuantizeSTE.apply(tensor, num_bits)
+
 class SimpleFullyConnected(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
         super(SimpleFullyConnected, self).__init__()
@@ -84,8 +106,8 @@ class ButterflyNetwork(nn.Module):
         self.B = SimpleFullyConnected(input_size, hidden_size, output_size)
         self.C = SimpleFullyConnected(2 * output_size, hidden_size, output_size)
         self.D = SimpleFullyConnected(output_size, hidden_size, output_size)
-        self.E = SimpleFullyConnected(2 * output_size, hidden_size, input_size)
-        self.F = SimpleFullyConnected(2 * output_size, hidden_size, input_size)
+        self.E = SimpleFullyConnected(2 * output_size, hidden_size, 2*input_size)
+        self.F = SimpleFullyConnected(2 * output_size, hidden_size, 2*input_size)
 
         # self.dropout = nn.Dropout(0.1)
         self.dropout = lambda x: link_dropout(x, 0.1)
@@ -182,50 +204,85 @@ class ButterflyNetwork(nn.Module):
 
         return y1, y2, [x_A, x_B, x_C, x_D, x_E, x_F]
 
+    def run_quantized(self, num_bits, x1, x2, noise_std_dev = None, dropped = None):
+
+        if dropped is None:
+            dropped = []
+
+        if noise_std_dev is None:
+            noise_std_dev = float(self.noise_std_dev)  # Ensure that noise_std_dev is a scalar (float)
+
+
+        x_A = self.A(x1) * self.scale_power
+        x_A = quantize_output(x_A, num_bits)
+        y_AC = self.add_noise(self.dropout(x_A) if 'AC' in dropped else x_A, noise_std_dev)
+        y_AE = self.add_noise(self.dropout(x_A) if 'AE' in dropped else x_A, noise_std_dev)
+
+        x_B = self.B(x2) * self.scale_power
+        x_B = quantize_output(x_B, num_bits)
+        y_BC = self.add_noise(self.dropout(x_B) if 'BC' in dropped else x_B, noise_std_dev)
+        y_BF = self.add_noise(self.dropout(x_B) if 'BF' in dropped else x_B, noise_std_dev)
+
+        x_C = self.C(torch.cat((y_AC, y_BC), dim=-1)) * self.scale_power
+        x_C = quantize_output(x_C, num_bits)
+        y_CD = self.add_noise(self.dropout(x_C) if 'CD' in dropped else x_C, noise_std_dev)
+
+        x_D = self.D(y_CD) * self.scale_power
+        x_D = quantize_output(x_D, num_bits)
+        y_DE = self.add_noise(self.dropout(x_D) if 'DE' in dropped else x_D, noise_std_dev)
+        y_DF = self.add_noise(self.dropout(x_D) if 'DF' in dropped else x_D, noise_std_dev)
+
+        x_E = self.E(torch.cat((y_AE, y_DE), dim=-1)) * self.scale_power
+        x_F = self.F(torch.cat((y_BF, y_DF), dim=-1)) * self.scale_power
+
+        y1 = x_E
+        y2 = x_F
+
+        return y1, y2, [x_A, x_B, x_C, x_D, x_E, x_F]
 
 # general graph?
-# class GraphButterflyNetwork(nn.Module):
-#     def __init__(self, input_size, hidden_size, output_size, noise_std_dev, adjacency_matrix):
-#         super(GraphButterflyNetwork, self).__init__()
-#         self.noise_std_dev = noise_std_dev
-#         self.adjacency_matrix = adjacency_matrix
-#         self.num_nodes = len(adjacency_matrix)
+class GraphButterflyNetwork(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, noise_std_dev, adjacency_matrix):
+        super(GraphButterflyNetwork, self).__init__()
+        self.noise_std_dev = noise_std_dev
+        self.adjacency_matrix = adjacency_matrix
+        self.num_nodes = len(adjacency_matrix)
 
-#         # Create a ModuleList of FullyConnected layers for each node
-#         self.nodes = nn.ModuleList([
-#             FullyConnected(input_size, hidden_size, output_size)
-#             for _ in range(self.num_nodes)
-#         ])
+        # Create a ModuleList of FullyConnected layers for each node
+        self.nodes = nn.ModuleList([
+            SimpleFullyConnected(input_size, hidden_size, output_size)
+            for _ in range(self.num_nodes)
+        ])
 
-#         # Compute the topological order of the nodes
-#         graph = nx.DiGraph(np.array(adjacency_matrix).T)
-#         self.topological_order = list(nx.topological_sort(graph))
+        # Compute the topological order of the nodes
+        graph = nx.DiGraph(np.array(adjacency_matrix).T)
+        self.topological_order = list(nx.topological_sort(graph))
 
-#     def add_noise(self, x):
-#         # Add Gaussian noise to the input tensor
-#         noise = torch.randn_like(x) * self.noise_std_dev
-#         return x + noise
+    def add_noise(self, x):
+        # Add Gaussian noise to the input tensor
+        noise = torch.randn_like(x) * self.noise_std_dev
+        return x + noise
 
-#     def forward(self, x1, x2):
-#         outputs = [None] * self.num_nodes
-#         outputs[0] = self.nodes[0](x1)
-#         outputs[1] = self.nodes[1](x2)
+    def forward(self, x1, x2):
+        outputs = [None] * self.num_nodes
+        outputs[0] = self.nodes[0](x1)
+        outputs[1] = self.nodes[1](x2)
 
-#         for i in self.topological_order[2:]:
-#             # Find the indices of the parent nodes based on the adjacency matrix
-#             parent_indices = [j for j, value in enumerate(self.adjacency_matrix[i]) if value == 1]
+        for i in self.topological_order[2:]:
+            # Find the indices of the parent nodes based on the adjacency matrix
+            parent_indices = [j for j, value in enumerate(self.adjacency_matrix[i]) if value == 1]
             
-#             # Concatenate the outputs of the parent nodes
-#             input_tensor = torch.cat([outputs[j] for j in parent_indices], dim=-1)
+            # Concatenate the outputs of the parent nodes
+            input_tensor = torch.cat([outputs[j] for j in parent_indices], dim=-1)
 
-#             # Pass the input through the current node without noise
-#             outputs[i] = self.nodes[i](input_tensor)
+            # Pass the input through the current node without noise
+            outputs[i] = self.nodes[i](input_tensor)
 
-#             # Add noise to the output
-#             outputs[i] = self.add_noise(outputs[i])
+            # Add noise to the output
+            outputs[i] = self.add_noise(outputs[i])
 
-#         y1, y2 = outputs[-2], outputs[-1]
-#         return y1, y2, outputs[:-2]
+        y1, y2 = outputs[-2], outputs[-1]
+        return y1, y2, outputs[:-2]
 
 # def custom_loss(output, target, adjacency_matrix, y_list):
 #     # Calculate the binary cross-entropy loss
@@ -253,14 +310,13 @@ def train(model, dataloader, optimizer, device, dropped_list = None):
         x1 = images[:, :, :14, :].view(images.size(0), -1).to(device)
         x2 = images[:, :, 14:, :].view(images.size(0), -1).to(device)
         
-        y1, y2, y_list = model(x1, x2, dropped = dropped_list)
-        
-        y = torch.cat((y1, y2), dim=1)
+        y1, y2, y_list = model(x1, x2, dropped = dropped_list)        
+        # y = torch.cat((y1, y2), dim=1)
         target = torch.cat((x1, x2), dim=1)
         
         # loss = custom_loss(y, target, adjacency_matrix, lambda_matrix, y_list)
         # loss = nn.BCEWithLogitsLoss()(y, target)
-        loss = nn.MSELoss()(y, target)
+        loss = nn.MSELoss()(y1, target) + nn.MSELoss()(y2, target)
 
         loss.backward()
         optimizer.step()
@@ -271,7 +327,7 @@ def train(model, dataloader, optimizer, device, dropped_list = None):
     
     return running_loss, psnr
 
-def test(model, dataloader, test_sigma_range, device):
+def test(model, dataloader, test_sigma_range, device, quantize = False, num_bits = 8):
     
     results = []
     model.eval()    
@@ -283,7 +339,10 @@ def test(model, dataloader, test_sigma_range, device):
                 x1 = images[:, :, :14, :].view(images.size(0), -1).to(device)
                 x2 = images[:, :, 14:, :].view(images.size(0), -1).to(device)
                 
-                y1, y2, y_list = model(x1, x2, noise_std_dev=sigma)
+                if not quantize:
+                    y1, y2, y_list = model(x1, x2, noise_std_dev=sigma)
+                else:
+                    y1, y2, y_list = model.run_quantized(num_bits, x1, x2, noise_std_dev=sigma)
                 
                 y = torch.cat((y1, y2), dim=1)
                 target = torch.cat((x1, x2), dim=1)
