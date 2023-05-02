@@ -26,8 +26,8 @@ def get_args():
     parser.add_argument(    '--input_size', type=int, default=14 * 28, help='Input size for the model')
     parser.add_argument(    '--hidden_size', type=int, default=256, help='Hidden size for the model')
     parser.add_argument(    '--output_size', type=int, default=256, help='Output size for the model')
-    parser.add_argument('-t_s', '--train_snr', type=float, default=40, help='Training SNR (40dB : sigma = 0.01)')
-    parser.add_argument('-v_s', '--val_snr', type=float, default=40, help='Validation SNR (40dB : sigma = 0.01)')
+    parser.add_argument('-t_s', '--train_snr', type=float, default=0, help='Training SNR (40dB : sigma = 0.01)')
+    parser.add_argument('-v_s', '--val_snr', type=float, default=0, help='Validation SNR (40dB : sigma = 0.01)')
     parser.add_argument('-p', '--power', type=int, default=1, help='Power for eq_noise_std_dev calculation')
     parser.add_argument('-lr', '--learning_rate', type=float, default=0.001, help='Learning rate for optimizer')
     parser.add_argument('-d', '--device', type=str, default='cpu', help='Device to use for training (cpu, cuda, mps)')
@@ -316,7 +316,7 @@ def train(model, dataloader, optimizer, device, dropped_list = None):
         
         # loss = custom_loss(y, target, adjacency_matrix, lambda_matrix, y_list)
         # loss = nn.BCEWithLogitsLoss()(y, target)
-        loss = nn.MSELoss()(y1, target) + nn.MSELoss()(y2, target)
+        loss = (nn.MSELoss()(y1, target) + nn.MSELoss()(y2, target))/2
 
         loss.backward()
         optimizer.step()
@@ -344,12 +344,12 @@ def test(model, dataloader, test_sigma_range, device, quantize = False, num_bits
                 else:
                     y1, y2, y_list = model.run_quantized(num_bits, x1, x2, noise_std_dev=sigma)
                 
-                y = torch.cat((y1, y2), dim=1)
+                # y = torch.cat((y1, y2), dim=1)
                 target = torch.cat((x1, x2), dim=1)
                 
                 # loss = custom_loss(y, target, adjacency_matrix, lambda_matrix, y_list)
                 # loss = nn.BCEWithLogitsLoss()(y, target)
-                loss = nn.MSELoss()(y, target)
+                loss = (nn.MSELoss()(y1, target) + nn.MSELoss()(y2, target))/2
                 
                 running_loss += loss.item()
             running_loss = running_loss / len(dataloader)
@@ -372,12 +372,12 @@ def test_dropped(model, dataloader, test_sigma_range, device, dropped = []):
                 
                 y1, y2, y_list = model.run_drop_link(x1, x2, noise_std_dev=sigma, dropped=dropped)
                 
-                y = torch.cat((y1, y2), dim=1)
+                # y = torch.cat((y1, y2), dim=1)
                 target = torch.cat((x1, x2), dim=1)
                 
                 # loss = custom_loss(y, target, adjacency_matrix, lambda_matrix, y_list)
                 # loss = nn.BCEWithLogitsLoss()(y, target)
-                loss = nn.MSELoss()(y, target)
+                loss = (nn.MSELoss()(y1, target) + nn.MSELoss()(y2, target))/2
                 
                 running_loss += loss.item()
             running_loss = running_loss / len(dataloader)
