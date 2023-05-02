@@ -316,7 +316,7 @@ def train(model, dataloader, optimizer, device, dropped_list = None):
         
         # loss = custom_loss(y, target, adjacency_matrix, lambda_matrix, y_list)
         # loss = nn.BCEWithLogitsLoss()(y, target)
-        loss = nn.MSELoss()(y1, target) + nn.MSELoss()(y2, target)
+        loss = (nn.MSELoss()(y1, target) + nn.MSELoss()(y2, target))/2
 
         loss.backward()
         optimizer.step()
@@ -344,12 +344,12 @@ def test(model, dataloader, test_sigma_range, device, quantize = False, num_bits
                 else:
                     y1, y2, y_list = model.run_quantized(num_bits, x1, x2, noise_std_dev=sigma)
                 
-                y = torch.cat((y1, y2), dim=1)
+                # y = torch.cat((y1, y2), dim=1)
                 target = torch.cat((x1, x2), dim=1)
                 
                 # loss = custom_loss(y, target, adjacency_matrix, lambda_matrix, y_list)
                 # loss = nn.BCEWithLogitsLoss()(y, target)
-                loss = nn.MSELoss()(y, target)
+                loss = (nn.MSELoss()(y1, target) + nn.MSELoss()(y2, target))/2
                 
                 running_loss += loss.item()
             running_loss = running_loss / len(dataloader)
@@ -372,12 +372,12 @@ def test_dropped(model, dataloader, test_sigma_range, device, dropped = []):
                 
                 y1, y2, y_list = model.run_drop_link(x1, x2, noise_std_dev=sigma, dropped=dropped)
                 
-                y = torch.cat((y1, y2), dim=1)
+                # y = torch.cat((y1, y2), dim=1)
                 target = torch.cat((x1, x2), dim=1)
                 
                 # loss = custom_loss(y, target, adjacency_matrix, lambda_matrix, y_list)
                 # loss = nn.BCEWithLogitsLoss()(y, target)
-                loss = nn.MSELoss()(y, target)
+                loss = (nn.MSELoss()(y1, target) + nn.MSELoss()(y2, target))/2
                 
                 running_loss += loss.item()
             running_loss = running_loss / len(dataloader)
@@ -399,8 +399,8 @@ if __name__ == '__main__':
     # change device to cuda or cpu .. mps is for mac-m1 gpu
     if args.device == 'cpu':
         device = torch.device("cpu") 
-    elif args.device == 'cuda':
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif 'cuda' in args.device:
+        device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     elif args.device == 'mps':
         device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
