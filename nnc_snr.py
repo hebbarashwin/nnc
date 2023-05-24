@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.quantized as nnq
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
@@ -21,20 +22,27 @@ def snr_db2sigma(snr):
 
 def get_args():
     parser = argparse.ArgumentParser(description='Butterfly Network Training')
-    parser.add_argument('-e', '--epochs', type=int, default=150, help='Number of training epochs')
+    parser.add_argument('-e', '--epochs', type=int, default=50, help='Number of training epochs')
     parser.add_argument('-b', '--batch_size', type=int, default=32, help='Batch size for training and testing')
-    parser.add_argument(    '--input_size', type=int, default=14 * 28, help='Input size for the model')
+    # parser.add_argument(    '--input_size', type=int, default=14 * 28, help='Input size for the model')
     parser.add_argument(    '--hidden_size', type=int, default=256, help='Hidden size for the model')
     parser.add_argument(    '--output_size', type=int, default=256, help='Output size for the model')
     parser.add_argument('-t_s', '--train_snr', type=float, default=0, help='Training SNR (40dB : sigma = 0.01)')
     parser.add_argument('-v_s', '--val_snr', type=float, default=0, help='Validation SNR (40dB : sigma = 0.01)')
-    parser.add_argument('-p', '--power', type=int, default=1, help='Power for eq_noise_std_dev calculation')
+    parser.add_argument('-p', '--power', type=float, default=1, help='Power for eq_noise_std_dev calculation')
     parser.add_argument('-lr', '--learning_rate', type=float, default=0.001, help='Learning rate for optimizer')
     parser.add_argument('-d', '--device', type=str, default='cpu', help='Device to use for training (cpu, cuda, mps)')
     parser.add_argument('-mp', '--model_path', type=str, default=None, help='Path to save and load the best model')
+    parser.add_argument(     '--load_model_path', type=str, default=None, help='Path to load the init model')
     parser.add_argument('--dropout', action='store_true', help='Add dropout during training')
     parser.add_argument('--test', action='store_true', help='Only test the model')
+    parser.add_argument('--dataset', choices=['mnist', 'fashion', 'imagenet', 'cifar10', 'stl10'], default = 'mnist')
     parser.add_argument('--scale_outputs', action='store_true', help='Scale outputs like paper')
+    parser.add_argument('--quantize', action='store_true', help='Scale outputs like paper')
+    parser.add_argument('--curriculum', action='store_true', help='Scale outputs like paper')
+    parser.add_argument('--random_snr', action='store_true', help='Scale outputs like paper')
+
+
     args = parser.parse_args()
 
     if args.model_path is None:
@@ -204,36 +212,80 @@ class ButterflyNetwork(nn.Module):
 
         return y1, y2, [x_A, x_B, x_C, x_D, x_E, x_F]
 
-    def run_quantized(self, num_bits, x1, x2, noise_std_dev = None, dropped = None):
+    # def run_quantized(self, num_bits, x1, x2, noise_std_dev = None, dropped = None):
 
+    #     if dropped is None:
+    #         dropped = []
+
+    #     if noise_std_dev is None:
+    #         noise_std_dev = float(self.noise_std_dev)  # Ensure that noise_std_dev is a scalar (float)
+
+
+    #     x_A = self.A(x1) * self.scale_power
+    #     x_A = quantize_output(x_A, num_bits)
+    #     y_AC = self.add_noise(self.dropout(x_A) if 'AC' in dropped else x_A, noise_std_dev)
+    #     y_AE = self.add_noise(self.dropout(x_A) if 'AE' in dropped else x_A, noise_std_dev)
+
+    #     x_B = self.B(x2) * self.scale_power
+    #     x_B = quantize_output(x_B, num_bits)
+    #     y_BC = self.add_noise(self.dropout(x_B) if 'BC' in dropped else x_B, noise_std_dev)
+    #     y_BF = self.add_noise(self.dropout(x_B) if 'BF' in dropped else x_B, noise_std_dev)
+
+    #     x_C = self.C(torch.cat((y_AC, y_BC), dim=-1)) * self.scale_power
+    #     x_C = quantize_output(x_C, num_bits)
+    #     y_CD = self.add_noise(self.dropout(x_C) if 'CD' in dropped else x_C, noise_std_dev)
+
+    #     x_D = self.D(y_CD) * self.scale_power
+    #     x_D = quantize_output(x_D, num_bits)
+    #     y_DE = self.add_noise(self.dropout(x_D) if 'DE' in dropped else x_D, noise_std_dev)
+    #     y_DF = self.add_noise(self.dropout(x_D) if 'DF' in dropped else x_D, noise_std_dev)
+
+    #     x_E = self.E(torch.cat((y_AE, y_DE), dim=-1)) * self.scale_power
+    #     x_F = self.F(torch.cat((y_BF, y_DF), dim=-1)) * self.scale_power
+
+    #     y1 = x_E
+    #     y2 = x_F
+
+    #     return y1, y2, [x_A, x_B, x_C, x_D, x_E, x_F]
+
+    def run_quantized(self, x1, x2, noise_std_dev=None, dropped=None):
         if dropped is None:
             dropped = []
 
         if noise_std_dev is None:
-            noise_std_dev = float(self.noise_std_dev)  # Ensure that noise_std_dev is a scalar (float)
+            noise_std_dev = float(self.noise_std_dev)
+
+        # with torch.no_grad():
+        # scale, zero_point = torch.tensor([1.0], requires_grad=True), torch.tensor([0], requires_grad=True)
+        # quantize = nnq.Quantize(scale, zero_point, torch.quint8)
+        # dequantize = nnq.DeQuantize()
+
+        def quantize_activation(tensor):
+            with torch.no_grad():
+                scale, zero_point = torch.tensor([1.0]), torch.tensor([0])
+                quantize = nnq.Quantize(scale, zero_point, torch.quint8)
+                dequantize = nnq.DeQuantize()
+                quantized_tensor = dequantize(quantize(tensor))
+            return quantized_tensor.clone().detach().requires_grad_(tensor.requires_grad)
 
 
-        x_A = self.A(x1) * self.scale_power
-        x_A = quantize_output(x_A, num_bits)
+        x_A = quantize_activation(self.A(x1) * self.scale_power)
         y_AC = self.add_noise(self.dropout(x_A) if 'AC' in dropped else x_A, noise_std_dev)
         y_AE = self.add_noise(self.dropout(x_A) if 'AE' in dropped else x_A, noise_std_dev)
 
-        x_B = self.B(x2) * self.scale_power
-        x_B = quantize_output(x_B, num_bits)
+        x_B = quantize_activation(self.B(x2) * self.scale_power)
         y_BC = self.add_noise(self.dropout(x_B) if 'BC' in dropped else x_B, noise_std_dev)
         y_BF = self.add_noise(self.dropout(x_B) if 'BF' in dropped else x_B, noise_std_dev)
 
-        x_C = self.C(torch.cat((y_AC, y_BC), dim=-1)) * self.scale_power
-        x_C = quantize_output(x_C, num_bits)
+        x_C = quantize_activation(self.C(torch.cat((y_AC, y_BC), dim=-1)) * self.scale_power)
         y_CD = self.add_noise(self.dropout(x_C) if 'CD' in dropped else x_C, noise_std_dev)
 
-        x_D = self.D(y_CD) * self.scale_power
-        x_D = quantize_output(x_D, num_bits)
+        x_D = quantize_activation(self.D(y_CD) * self.scale_power)
         y_DE = self.add_noise(self.dropout(x_D) if 'DE' in dropped else x_D, noise_std_dev)
         y_DF = self.add_noise(self.dropout(x_D) if 'DF' in dropped else x_D, noise_std_dev)
 
-        x_E = self.E(torch.cat((y_AE, y_DE), dim=-1)) * self.scale_power
-        x_F = self.F(torch.cat((y_BF, y_DF), dim=-1)) * self.scale_power
+        x_E = quantize_activation(self.E(torch.cat((y_AE, y_DE), dim=-1)) * self.scale_power)
+        x_F = quantize_activation(self.F(torch.cat((y_BF, y_DF), dim=-1)) * self.scale_power)
 
         y1 = x_E
         y2 = x_F
@@ -299,7 +351,7 @@ class GraphButterflyNetwork(nn.Module):
 #     # Return the total loss as the sum of the binary cross-entropy loss and the regularization term
 #     return mse_loss + expectation_loss
 
-def train(model, dataloader, optimizer, device, dropped_list = None):
+def train(model, dataloader, optimizer, device, train_sigma, dropped_list = None, quantize = False):
     model.train()
     running_loss = 0.0
 
@@ -307,10 +359,21 @@ def train(model, dataloader, optimizer, device, dropped_list = None):
     for images, labels in progress:
         optimizer.zero_grad()
         
-        x1 = images[:, :, :14, :].view(images.size(0), -1).to(device)
-        x2 = images[:, :, 14:, :].view(images.size(0), -1).to(device)
+        height = images.size(2)
+        mid_point = height // 2
+
+        x1 = images[:, :, :mid_point, :].reshape(images.size(0), -1).to(device)
+        x2 = images[:, :, mid_point:, :].reshape(images.size(0), -1).to(device)
         
-        y1, y2, y_list = model(x1, x2, dropped = dropped_list)        
+        if train_sigma == 'random':
+            snr = np.random.uniform(-40, 40)
+            sigma = snr_db2sigma(snr)
+        else:
+            sigma = train_sigma
+        if quantize:
+            y1, y2, y_list = model.run_quantized(x1, x2, noise_std = sigma, dropped = dropped_list)  
+        else:       
+            y1, y2, y_list = model(x1, x2, noise_std_dev = sigma, dropped = dropped_list)        
         # y = torch.cat((y1, y2), dim=1)
         target = torch.cat((x1, x2), dim=1)
         
@@ -327,7 +390,7 @@ def train(model, dataloader, optimizer, device, dropped_list = None):
     
     return running_loss, psnr
 
-def test(model, dataloader, test_sigma_range, device, quantize = False, num_bits = 8):
+def test(model, dataloader, test_sigma_range, device, quantize = False):
     
     results = []
     model.eval()    
@@ -336,13 +399,16 @@ def test(model, dataloader, test_sigma_range, device, quantize = False, num_bits
             snr = snr_sigma2db(sigma)
             running_loss = 0.0
             for images, labels in dataloader:
-                x1 = images[:, :, :14, :].view(images.size(0), -1).to(device)
-                x2 = images[:, :, 14:, :].view(images.size(0), -1).to(device)
+                height = images.size(2)
+                mid_point = height // 2
+
+                x1 = images[:, :, :mid_point, :].reshape(images.size(0), -1).to(device)
+                x2 = images[:, :, mid_point:, :].reshape(images.size(0), -1).to(device)
                 
                 if not quantize:
                     y1, y2, y_list = model(x1, x2, noise_std_dev=sigma)
                 else:
-                    y1, y2, y_list = model.run_quantized(num_bits, x1, x2, noise_std_dev=sigma)
+                    y1, y2, y_list = model.run_quantized(x1, x2, noise_std_dev=sigma)
                 
                 # y = torch.cat((y1, y2), dim=1)
                 target = torch.cat((x1, x2), dim=1)
@@ -367,8 +433,11 @@ def test_dropped(model, dataloader, test_sigma_range, device, dropped = []):
             snr = snr_sigma2db(sigma)
             running_loss = 0.0
             for images, labels in dataloader:
-                x1 = images[:, :, :14, :].view(images.size(0), -1).to(device)
-                x2 = images[:, :, 14:, :].view(images.size(0), -1).to(device)
+                height = images.size(2)
+                mid_point = height // 2
+
+                x1 = images[:, :, :mid_point, :].reshape(images.size(0), -1).to(device)
+                x2 = images[:, :, mid_point:, :].reshape(images.size(0), -1).to(device)
                 
                 y1, y2, y_list = model.run_drop_link(x1, x2, noise_std_dev=sigma, dropped=dropped)
                 
@@ -427,19 +496,49 @@ if __name__ == '__main__':
     # ], dtype=torch.float32)
 
 
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,))
-    ])
+    if args.dataset == 'mnist':
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.1307,), (0.3081,))
+        ])
 
-    train_dataset = torchvision.datasets.MNIST(root='./data', train=True, transform=transform, download=True)
-    test_dataset = torchvision.datasets.MNIST(root='./data', train=False, transform=transform, download=True)
+        train_dataset = torchvision.datasets.MNIST(root='./data', train=True, transform=transform, download=True)
+        test_dataset = torchvision.datasets.MNIST(root='./data', train=False, transform=transform, download=True)
+    elif args.dataset == 'fashion':
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.1307,), (0.3081,))
+        ])
+
+        train_dataset = torchvision.datasets.FashionMNIST(root='./data', train=True, transform=transform, download=True)
+        test_dataset = torchvision.datasets.FashionMNIST(root='./data', train=False, transform=transform, download=True)
+    elif args.dataset == 'cifar10':
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        ])
+
+        train_dataset = torchvision.datasets.CIFAR10(root='./data', train=True, transform=transform, download=True)
+        test_dataset = torchvision.datasets.CIFAR10(root='./data', train=False, transform=transform, download=True)
+    elif args.dataset == 'stl10':
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        ])
+        train_dataset = torchvision.datasets.STL10(root='./data', split='train', transform=transform, download=True)
+        test_dataset = torchvision.datasets.STL10(root='./data', split='test', transform=transform, download=True)
+
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
-
-    model = ButterflyNetwork(args.input_size, args.hidden_size, args.output_size, eq_train_sigma, scale_power).to(device)
+    sample_image, _ = train_dataset[0]
+    input_size = sample_image.size(2)*sample_image.size(1)*sample_image.size(0) // 2
+    model = ButterflyNetwork(input_size, args.hidden_size, args.output_size, eq_train_sigma, scale_power).to(device)
     
+    if args.load_model_path is not None:
+        model.load_state_dict(torch.load(args.load_model_path, map_location=device))
+    model.train()
+
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
     if not args.test:
         try:
@@ -448,9 +547,20 @@ if __name__ == '__main__':
                     dropped_list = ['AE', 'BF']
                 else:
                     dropped_list = []
-                for epoch in epoch_progress:
-                    train_loss, train_psnr = train(model, train_loader, optimizer, device, dropped_list)
-                    results = test(model, test_loader, np.array([eq_val_sigma]), device)
+                for epoch_num, epoch in enumerate(epoch_progress):
+                    if args.curriculum:
+                        train_snrs = np.linspace(0, -40, args.epochs)
+                        train_sigma = np.array([snr_db2sigma(snr) for snr in train_snrs])
+                        if args.scale_outputs:
+                            eq_train_sigmas = train_sigma
+                        else:
+                            eq_train_sigmas = train_sigma / np.sqrt(args.power)
+                        train_loss, train_psnr = train(model, train_loader, optimizer, device, eq_train_sigmas[epoch_num], dropped_list, args.quantize)
+                    elif args.random_snr:
+                        train_loss, train_psnr = train(model, train_loader, optimizer, device, 'random', dropped_list, args.quantize)
+                    else:
+                        train_loss, train_psnr = train(model, train_loader, optimizer, device, eq_train_sigma, dropped_list, args.quantize)
+                    results = test(model, test_loader, np.array([eq_val_sigma]), device, quantize = args.quantize)
                     val_snrs, test_losses, test_psnrs = zip(*results)
                     val_snr = val_snrs[0]
                     test_loss = test_losses[0]
@@ -490,13 +600,19 @@ if __name__ == '__main__':
         snr_range, test_losses, test_psnrs = zip(*result)
         test_losses_str = ', '.join([f"{loss:.4f}" for loss in test_losses])
         test_psnrs_str = ', '.join([f"{psnr:.4f}" for psnr in test_psnrs])
-        print(f"Loaded model:\n SNR range: {snr_range}\n Test Loss: {test_losses_str}\n Test PSNR: {test_psnrs_str}")
+        print(f"Normal:\n SNR range: {snr_range}\n Test Loss: {test_losses_str}\n Test PSNR: {test_psnrs_str}")
 
         result = test_dropped(model, test_loader, eq_test_sigma, device, ['AE'])
         snr_range, test_losses, test_psnrs = zip(*result)
         test_losses_str = ', '.join([f"{loss:.4f}" for loss in test_losses])
         test_psnrs_str = ', '.join([f"{psnr:.4f}" for psnr in test_psnrs])
-        print(f"Loaded model:\n SNR range: {snr_range}\n Test Loss: {test_losses_str}\n Test PSNR: {test_psnrs_str}")
+        print(f"Link dropped:\n SNR range: {snr_range}\n Test Loss: {test_losses_str}\n Test PSNR: {test_psnrs_str}")
+
+        result = test(model, test_loader, eq_test_sigma, device, quantize = True)
+        snr_range, test_losses, test_psnrs = zip(*result)
+        test_losses_str = ', '.join([f"{loss:.4f}" for loss in test_losses])
+        test_psnrs_str = ', '.join([f"{psnr:.4f}" for psnr in test_psnrs])
+        print(f"Quantized:\n SNR range: {snr_range}\n Test Loss: {test_losses_str}\n Test PSNR: {test_psnrs_str}")
     else:
         print(f"No model found at {model_path}")
 

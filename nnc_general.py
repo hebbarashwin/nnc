@@ -5,7 +5,6 @@ import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 
-import networkx as nx
 import argparse
 import random
 import numpy as np
@@ -33,8 +32,9 @@ def get_args():
     parser.add_argument('-lr', '--learning_rate', type=float, default=0.001, help='Learning rate for optimizer')
     parser.add_argument('-d', '--device', type=str, default='cpu', help='Device to use for training (cpu, cuda, mps)')
     parser.add_argument('-mp', '--model_path', type=str, default=None, help='Path to save and load the best model')
-    parser.add_argument('--dropout', action='store_true', help='Add dropout during training')
+    parser.add_argument('--dropout', type=float, default=0., help='Add dropout during training')
     parser.add_argument('--test', action='store_true', help='Only test the model')
+    parser.add_argument('--pruned', action='store_true', help='Only test the model')
     parser.add_argument('--scale_outputs', action='store_true', help='Scale outputs like paper')
     args = parser.parse_args()
 
@@ -75,7 +75,7 @@ class SimpleFullyConnected(nn.Module):
 
         return x
 
-def train(model, dataloader, optimizer, device, dropped_list = None):
+def train(model, dataloader, optimizer, device, dropped_list = None, dropout = 0.):
     model.train()
     running_loss = 0.0
 
@@ -94,7 +94,7 @@ def train(model, dataloader, optimizer, device, dropped_list = None):
             x4 = images[:, :, 14:, 14:].reshape(images.size(0), -1).to(device)
             x = [x1, x2, x3, x4]
         
-        output_list = model(x)#, dropped = dropped_list)
+        output_list = model(x, dropout_probability = dropout, dropped = dropped_list)
         
         target = images.view(images.size(0), -1).to(device)
         
@@ -162,33 +162,56 @@ def test(model, dataloader, test_sigma_range, device, quantize = False, num_bits
 
     return results
 
-# def test_dropped(model, dataloader, test_sigma_range, device, dropped = []):
+def test_dropped(model, dataloader, test_sigma_range, device, dropped = [] , quantize = False, num_bits = 8):
     
-#     results = []
-#     model.eval()    
-#     with torch.no_grad():
-#         for sigma in test_sigma_range:
-#             snr = snr_sigma2db(sigma)
-#             running_loss = 0.0
-#             for images, labels in dataloader:
-#                 x1 = images[:, :, :14, :].view(images.size(0), -1).to(device)
-#                 x2 = images[:, :, 14:, :].view(images.size(0), -1).to(device)
+    results = []
+    model.eval()    
+    with torch.no_grad():
+        for sigma in test_sigma_range:
+            snr = snr_sigma2db(sigma)
+            running_loss = 0.0
+            for images, labels in dataloader:
+                # x1 = images[:, :, :14, :].view(images.size(0), -1).to(device)
+                # x2 = images[:, :, 14:, :].view(images.size(0), -1).to(device)
                 
-#                 y1, y2, y_list = model.run_drop_link(x1, x2, noise_std_dev=sigma, dropped=dropped)
+                # if not quantize:
+                #     y1, y2, y_list = model(x1, x2, noise_std_dev=sigma)
+                # else:
+                #     y1, y2, y_list = model.run_quantized(num_bits, x1, x2, noise_std_dev=sigma)
                 
-#                 y = torch.cat((y1, y2), dim=1)
-#                 target = torch.cat((x1, x2), dim=1)
+                # y = torch.cat((y1, y2), dim=1)
+                # target = torch.cat((x1, x2), dim=1)
                 
-#                 # loss = custom_loss(y, target, adjacency_matrix, lambda_matrix, y_list)
-#                 # loss = nn.BCEWithLogitsLoss()(y, target)
-#                 loss = nn.MSELoss()(y, target)
-                
-#                 running_loss += loss.item()
-#             running_loss = running_loss / len(dataloader)
-#             psnr = 10*np.log10(torch.max(images)**2 / running_loss).item()
-#             results.append((snr, running_loss, psnr))
+                # # loss = custom_loss(y, target, adjacency_matrix, lambda_matrix, y_list)
+                # # loss = nn.BCEWithLogitsLoss()(y, target)
+                # loss = nn.MSELoss()(y, target)
 
-#     return results
+                if len(model.graph_inputs) == 2:
+                    x1 = images[:, :, :14, :].view(images.size(0), -1).to(device)
+                    x2 = images[:, :, 14:, :].view(images.size(0), -1).to(device)
+                    x = [x1, x2]
+                elif len(model.graph_inputs) == 4:
+                    x1 = images[:, :, :14, :14].reshape(images.size(0), -1).to(device)
+                    x2 = images[:, :, 14:, :14].reshape(images.size(0), -1).to(device)
+                    x3 = images[:, :, :14, 14:].reshape(images.size(0), -1).to(device)
+                    x4 = images[:, :, 14:, 14:].reshape(images.size(0), -1).to(device)
+                    x = [x1, x2, x3, x4]
+                
+                output_list = model(x, noise_std_dev = sigma, dropped = dropped, dropout_probability = 1)#, dropped = dropped_list)
+                
+                target = images.view(images.size(0), -1).to(device)
+                
+                # loss = custom_loss(y, target, adjacency_matrix, lambda_matrix, y_list)
+                # loss = nn.BCEWithLogitsLoss()(y, target)
+                # loss = nn.MSELoss()(y, target)
+                loss = torch.mean(torch.stack([nn.MSELoss()(y, target) for y in output_list]))
+
+                running_loss += loss.item()
+            running_loss = running_loss / len(dataloader)
+            psnr = 10*np.log10(torch.max(images)**2 / running_loss).item()
+            results.append((snr, running_loss, psnr))
+
+    return results
 
 
 import torch
@@ -207,10 +230,11 @@ class GeneralDAG(nn.Module):
         self.nn_modules = nn.ModuleDict()
         self.noise_std_dev = noise_std_dev
         self.scale_power = scale_power
-        
+        self.edges = []
         # Create Node objects
         for name, output_nodes in nodes_dict.items():
             self.nodes[name] = Node(name, output_nodes)
+            self.edges.extend([(name, onn) for onn in output_nodes])
         
         # Add inputs to Node objects
         for node in self.nodes.values():
@@ -229,7 +253,7 @@ class GeneralDAG(nn.Module):
             if num_inputs == 0:
                 i_size = input_size 
             else:
-                i_size = num_inputs * hidden_size
+                i_size = num_inputs * output_size
 
             if num_outputs == 0:
                 o_size = len(self.graph_inputs)*input_size 
@@ -260,29 +284,51 @@ class GeneralDAG(nn.Module):
     def get_graph_outputs(self):
         return [node.name for node in self.nodes.values() if not node.output_nodes] 
 
+    def link_dropout(self, x, p):
+        # x - batched input (first dimension is batch)
+        assert 0 <= p <= 1
+
+        # Generate a random number for each example in the batch
+        random_numbers = torch.rand(x.size(0), 1, device=x.device)
+        # Create a mask with the same size as the input_tensor
+        dropout_mask = (random_numbers >= p).float()
+        # Expand the dropout mask to match the shape of the input_tensor
+        dropout_mask = dropout_mask.expand_as(x)
+        # Apply the dropout mask to the input_tensor
+        output_tensor = x * dropout_mask
+        
+        return output_tensor
+
     def add_noise(self, x, noise_std_dev):
         # Add Gaussian noise to the input tensor
         noise = torch.randn_like(x) * noise_std_dev
         return x + noise
-    
-    def forward(self, x, noise_std_dev = None, dropped=None):
+
+    def forward(self, x, noise_std_dev = None, dropped=None, dropout_probability = 0.):
 
         if noise_std_dev is None:
             noise_std_dev = float(self.noise_std_dev)  # Ensure that noise_std_dev is a scalar (float)
 
         if dropped is None:
-            dropped = []
+            dropped = []#self.edges 
 
+        
+        assert 0 <= dropout_probability <= 1
+
+        # print(dropped, dropout_probability)
         forward_outputs = {}
         assert len(x) == len(self.graph_inputs)
         for i, node_name in enumerate(self.graph_inputs) :
             forward_outputs[node_name] = self.nn_modules[str(node_name)](x[i])
 
         node_order = self.topological_sort()
+        # I want to traverse the graph nodes only after all their parents have been traversed.
         node_order = [n for n in node_order if n not in self.graph_inputs]
         for node_name in node_order:
             node = self.nodes[node_name]
-            NN_input = torch.cat([self.add_noise(forward_outputs[input_node], noise_std_dev) for input_node in node.input_nodes], dim = -1)
+            
+            # NN_input = torch.cat([self.add_noise(forward_outputs[input_node], noise_std_dev) for input_node in node.input_nodes], dim = -1)
+            NN_input = torch.cat([self.add_noise(self.link_dropout(forward_outputs[input_node], dropout_probability if (input_node, node_name) not in dropped else 1), noise_std_dev) for input_node in node.input_nodes], dim=-1)
             forward_outputs[node_name] = self.nn_modules[str(node_name)](NN_input) * self.scale_power
 
         return [forward_outputs[node_name] for node_name in self.graph_outputs]
@@ -300,19 +346,34 @@ if __name__ == '__main__':
 
     # # define graph nodes : 4 inputs
     if args.num_inputs == 4:
-        nodes = {}
-        nodes[0] = [4,5]
-        nodes[1] = [4,5]
-        nodes[2] = [5,6]
-        nodes[3] = [6,9]
-        nodes[4] = [7]
-        nodes[5] = [7,8,9]
-        nodes[6] = [7,8,9]
-        nodes[7] = [10,11]
-        nodes[8] = [10]
-        nodes[9] = [10,11]
-        nodes[10] = []
-        nodes[11] = []
+        if args.pruned:
+            nodes = {}
+            nodes[0] = [5]
+            nodes[1] = [4,5]
+            nodes[2] = [5]
+            nodes[3] = [6,9]
+            nodes[4] = [7]
+            nodes[5] = [8,9]
+            nodes[6] = [7,8,9]
+            nodes[7] = [10,11]
+            nodes[8] = [10]
+            nodes[9] = [10,11]
+            nodes[10] = []
+            nodes[11] = []
+        else:
+            nodes = {}
+            nodes[0] = [4,5]
+            nodes[1] = [4,5]
+            nodes[2] = [5,6]
+            nodes[3] = [6,9]
+            nodes[4] = [7]
+            nodes[5] = [7,8,9]
+            nodes[6] = [7,8,9]
+            nodes[7] = [10,11]
+            nodes[8] = [10]
+            nodes[9] = [10,11]
+            nodes[10] = []
+            nodes[11] = []
 
     # define graph nodes : 2 inputs - butterfly
     elif args.num_inputs == 2:
@@ -365,12 +426,13 @@ if __name__ == '__main__':
     if not args.test:
         try:
             with tqdm(range(args.epochs), desc="Epochs") as epoch_progress:
-                if args.dropout:
-                    dropped_list = ['AE', 'BF']
-                else:
-                    dropped_list = []
+                # if args.dropout:
+                #     dropped_list = ['AE', 'BF']
+                # else:
+                #     dropped_list = []
+                dropped_list = None # If only specific edges, pass list of input-output tuples.
                 for epoch in epoch_progress:
-                    train_loss, train_psnr = train(model, train_loader, optimizer, device, dropped_list)
+                    train_loss, train_psnr = train(model, train_loader, optimizer, device, dropped_list, args.dropout)
                     results = test(model, test_loader, np.array([eq_val_sigma]), device)
                     val_snrs, test_losses, test_psnrs = zip(*results)
                     val_snr = val_snrs[0]
@@ -413,11 +475,11 @@ if __name__ == '__main__':
         test_psnrs_str = ', '.join([f"{psnr:.4f}" for psnr in test_psnrs])
         print(f"Loaded model:\n SNR range: {snr_range}\n Test Loss: {test_losses_str}\n Test PSNR: {test_psnrs_str}")
 
-        # result = test_dropped(model, test_loader, eq_test_sigma, device, ['AE'])
-        # snr_range, test_losses, test_psnrs = zip(*result)
-        # test_losses_str = ', '.join([f"{loss:.4f}" for loss in test_losses])
-        # test_psnrs_str = ', '.join([f"{psnr:.4f}" for psnr in test_psnrs])
-        # print(f"Loaded model:\n SNR range: {snr_range}\n Test Loss: {test_losses_str}\n Test PSNR: {test_psnrs_str}")
+        result = test_dropped(model, test_loader, eq_test_sigma, device, [(5,7), (2,6), (0,4)])
+        snr_range, test_losses, test_psnrs = zip(*result)
+        test_losses_str = ', '.join([f"{loss:.4f}" for loss in test_losses])
+        test_psnrs_str = ', '.join([f"{psnr:.4f}" for psnr in test_psnrs])
+        print(f"Loaded model:\n SNR range: {snr_range}\n Test Loss: {test_losses_str}\n Test PSNR: {test_psnrs_str}")
     else:
         print(f"No model found at {model_path}")
 
